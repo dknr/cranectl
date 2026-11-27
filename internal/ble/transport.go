@@ -15,8 +15,10 @@ import (
 
 // Zhiyun GATT layout — the app's variable names in tc/e0.java are misleading.
 // BlueZ reports the ground truth for the M2S:
-//   …-9600  Flags: [write-without-response]   app → gimbal
-//   …-9601  Flags: [notify]                   gimbal → app
+//
+//	…-9600  Flags: [write-without-response]   app → gimbal
+//	…-9601  Flags: [notify]                   gimbal → app
+//
 // Both live under the Quintic Corp. primary service (0000fee9-…).
 // The …-9610 UUID that appears in the APK is absent on M2S.
 const (
@@ -224,12 +226,18 @@ func norm(s string) string {
 	return string(out)
 }
 
-// Close tears down the connection.
+// Close stops the local notification dispatcher. It deliberately does NOT
+// tear down the BLE link: a clean BlueZ Disconnect over D-Bus blocks ~2.5 s
+// and does not even drop the link (the OS/BlueZ keeps the paired device
+// connected regardless), so disconnecting on every one-shot command would
+// add ~2.5 s of pure overhead and still leave the gimbal connected. When the
+// process exits, BlueZ reaps our D-Bus client and its notification watch;
+// the link stays up for the next cranectl invocation to reuse (near-instant
+// connect). To explicitly release the gimbal, use `bluetoothctl disconnect`.
 func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.done)
-		err = c.dev.Disconnect()
 	})
 	return err
 }
@@ -249,23 +257,35 @@ func (c *Conn) SendFrame(f protocol.Frame, timeout time.Duration) (protocol.Fram
 		c.mu.Unlock()
 	}()
 
-	if c.debug {
-		fmt.Printf("TX % x\n", b)
+	// Fire-and-forget writes occasionally lose their ack over BLE, so resend
+	// once on timeout. These protocol commands are idempotent set-ops (and the
+	// Zhiyun app itself does not wait on them), so resending the same frame is
+	// safe.
+	const attempts = 2
+	for i := 0; i < attempts; i++ {
+		if c.debug {
+			if i == 0 {
+				fmt.Printf("TX % x\n", b)
+			} else {
+				fmt.Printf("TX(retry) % x\n", b)
+			}
+		}
+		if _, err := c.wch.WriteWithoutResponse(b); err != nil {
+			return protocol.Frame{}, fmt.Errorf("write: %w", err)
+		}
+		t := time.NewTimer(timeout)
+		select {
+		case reply := <-ch:
+			t.Stop()
+			return reply, nil
+		case <-t.C:
+			t.Stop() // timed out; retry
+		case <-c.done:
+			t.Stop()
+			return protocol.Frame{}, io.ErrClosedPipe
+		}
 	}
-	if _, err := c.wch.WriteWithoutResponse(b); err != nil {
-		return protocol.Frame{}, fmt.Errorf("write: %w", err)
-	}
-
-	t := time.NewTimer(timeout)
-	defer t.Stop()
-	select {
-	case reply := <-ch:
-		return reply, nil
-	case <-t.C:
-		return protocol.Frame{}, fmt.Errorf("timeout waiting for reply to seq=%d opcode=0x%04X", f.Seq, f.Opcode)
-	case <-c.done:
-		return protocol.Frame{}, io.ErrClosedPipe
-	}
+	return protocol.Frame{}, fmt.Errorf("timeout waiting for reply to seq=%d opcode=0x%04X (after %d attempts)", f.Seq, f.Opcode, attempts)
 }
 
 // NextSeq returns a fresh sequence byte (1..127 wrapping), matching the
