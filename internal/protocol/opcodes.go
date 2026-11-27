@@ -1,22 +1,18 @@
 package protocol
 
-// Opcodes for commands used by the info feature.
-// Values are the 16-bit encodings per SPEC-ble-frame.md.
-// Group nibble is stripped on the wire; these constants preserve it so the
-// name is easy to match against InteractCode.java.
+// Opcodes used by cranectl. Values are the 16-bit encodings per
+// SPEC-ble-frame.md. Group nibble is stripped on the wire; these constants
+// preserve it so the name is easy to match against InteractCode.java.
+
+// — Info reads (used by `cranectl info`) —
 var (
-	// Manufacturer/device identity — read as four uint16 words, concatenated
-	// (D,C,B,A) big-endian into an 8-byte device identifier.
-	// Stabilizer.java:1543 (W8).
 	OpcodeMakeInfoA = Opcode(0, 1, 124)
 	OpcodeMakeInfoB = Opcode(0, 1, 125)
 	OpcodeMakeInfoC = Opcode(0, 1, 126)
 	OpcodeMakeInfoD = Opcode(0, 1, 127)
 
-	// GET_BATTERY_VOLTAGE = h(0, 1, 6).
 	OpcodeBattery = Opcode(0, 1, 6)
 
-	// IMU (type=0xC0) firmware/hardware/machine version reads.
 	OpcodeIMUBootAdr        = Opcode(192, 1, 16)
 	OpcodeIMUMachineVersion = Opcode(192, 1, 17)
 	OpcodeIMUBootVersion    = Opcode(192, 1, 18)
@@ -25,7 +21,6 @@ var (
 	OpcodeIMUUUIDHigh       = Opcode(192, 1, 21)
 	OpcodeIMUFirmwareVer    = Opcode(192, 1, 22)
 
-	// ICU (main MCU) — same encodings as Z-axis motor per InteractCode.
 	OpcodeICUBootAdr        = Opcode(192, 4, 16)
 	OpcodeICUMachineVersion = Opcode(192, 4, 17)
 	OpcodeICUBootVersion    = Opcode(192, 4, 18)
@@ -33,7 +28,21 @@ var (
 	OpcodeICUUUIDLow        = Opcode(192, 4, 20)
 	OpcodeICUUUIDHigh       = Opcode(192, 4, 21)
 	OpcodeICUFirmwareVer    = Opcode(192, 4, 22)
+)
 
-	// PowerOn (h(192,1,3)) — handy smoke test; do NOT send from `info`.
-	OpcodePowerOn = Opcode(192, 1, 3)
+// — Movement (used by `cranectl <MAC> move`) —
+// The Zhiyun point-to-position protocol is a state machine. Rotation
+// opcodes only take effect between LOCATION_POINT_CONTROLLER(0) and
+// LOCATION_POINT_CONTROLLER(1), and the whole sequence must run with
+// LOCATION_SET_POINT_POWERED(1) asserted. See com/zhiyun/device/a.java:93.
+var (
+	OpcodeLocationSetPointPowered    = Opcode(192, 1, 48) // 0xC130
+	OpcodeLocationPointController    = Opcode(192, 1, 49) // 0xC131
+	OpcodeLocationPointStateRegister = Opcode(192, 1, 50) // 0xC132
+	OpcodePitchRotateAngle           = Opcode(192, 1, 51) // 0xC133
+	OpcodeRollRotateAngle            = Opcode(192, 1, 52) // 0xC134
+	OpcodeYawRotateAngle             = Opcode(192, 1, 53) // 0xC135
+	OpcodeMotionTimeLow              = Opcode(192, 1, 54) // 0xC136
+	OpcodeMotionTimeHigh             = Opcode(192, 1, 55) // 0xC137
+	OpcodeSetButtonEvent             = Opcode(192, 1, 32) // 0xC120
 )

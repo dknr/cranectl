@@ -3,7 +3,9 @@ package gimbal
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -11,27 +13,39 @@ import (
 	"cranectl/internal/protocol"
 )
 
-// Default per-command reply timeout. Zhiyun's own app uses RxJava with
-// generous defaults; 2s is comfortable for a good link.
-const DefaultTimeout = 5 * time.Second
+// DefaultTimeout is the per-command reply timeout.
+const DefaultTimeout = 2 * time.Second
+
+// DefaultMotionTimeMS is the point-to-position motion envelope.
+const DefaultMotionTimeMS uint32 = 1500
 
 // Info holds whatever we could read from the gimbal.
 type Info struct {
-	MakeInfoHex       string
-	MakeInfoWords     [4]uint16 // A, B, C, D
-	BatteryVolts      uint16
-	IMUFirmwareVer    uint16
-	IMUHardwareVer    uint16
-	IMUMachineVer     uint16
-	IMUBootVer        uint16
-	IMUUUIDHigh       uint16
-	IMUUUIDLow        uint16
-	ICUFirmwareVer    uint16
-	ICUHardwareVer    uint16
-	ICUMachineVer     uint16
-	ICUBootVer        uint16
-	ICUUUIDHigh       uint16
-	ICUUUIDLow        uint16
+	MakeInfoHex    string
+	MakeInfoWords  [4]uint16 // A, B, C, D
+	BatteryVolts   uint16
+	IMUFirmwareVer uint16
+	IMUHardwareVer uint16
+	IMUMachineVer  uint16
+	IMUBootVer     uint16
+	IMUUUIDHigh    uint16
+	IMUUUIDLow     uint16
+	ICUFirmwareVer uint16
+	ICUHardwareVer uint16
+	ICUMachineVer  uint16
+	ICUBootVer     uint16
+	ICUUUIDHigh    uint16
+	ICUUUIDLow     uint16
+}
+
+// MoveParams describes one point-to-position waypoint. Nil axis means
+// "leave this axis alone" — mirrors cc/q1.java's 65535.0f sentinel.
+// Time is the motion envelope in milliseconds (0 → DefaultMotionTimeMS).
+type MoveParams struct {
+	Yaw   *float64
+	Roll  *float64
+	Pitch *float64
+	Time  uint32
 }
 
 // Device is a connected gimbal session.
@@ -55,18 +69,12 @@ func (d *Device) Close() error { return d.conn.Close() }
 // SetDebug enables hex dumps of every frame written and received.
 func (d *Device) SetDebug(on bool) { d.conn.SetDebug(on) }
 
-// read is a small helper with the session default timeout.
-func (d *Device) read(opcode uint16) (uint16, error) {
-	return d.conn.Read(opcode, d.timeout)
-}
-
 // ReadInfo probes the gimbal for identity and firmware versions.
-// Fields that time out or error are left zero and reported via Warns.
+// Fields that fail are left zero and reported via warns.
 func (d *Device) ReadInfo() (Info, []string, error) {
 	var info Info
 	var warns []string
 
-	// Make info (A..D) is the identity — if this fails we bail.
 	words := []struct {
 		opcode uint16
 		name   string
@@ -78,22 +86,20 @@ func (d *Device) ReadInfo() (Info, []string, error) {
 		{protocol.OpcodeMakeInfoD, "MAKE_INFO_D", &info.MakeInfoWords[3]},
 	}
 	for _, w := range words {
-		v, err := d.read(w.opcode)
+		v, err := d.conn.Read(w.opcode, d.timeout)
 		if err != nil {
 			return info, warns, fmt.Errorf("read %s: %w", w.name, err)
 		}
 		*w.target = v
 	}
 	// Assemble per cc/l0.java: bytes = BE(D) || BE(C) || BE(B) || BE(A),
-	// hex-formatted with a leading zero stripped.
+	// hex-formatted with any leading zeros stripped.
 	raw := make([]byte, 0, 8)
 	for _, i := range []int{3, 2, 1, 0} {
 		raw = append(raw, byte(info.MakeInfoWords[i]>>8), byte(info.MakeInfoWords[i]))
 	}
-	hexStr := strings.ToUpper(hex.EncodeToString(raw))
-	info.MakeInfoHex = strings.TrimLeft(hexStr, "0")
+	info.MakeInfoHex = strings.TrimLeft(strings.ToUpper(hex.EncodeToString(raw)), "0")
 
-	// Best-effort extras — record per-field failures rather than abort.
 	extras := []struct {
 		opcode uint16
 		name   string
@@ -114,7 +120,7 @@ func (d *Device) ReadInfo() (Info, []string, error) {
 		{protocol.OpcodeICUUUIDLow, "ICU.UUIDLow", &info.ICUUUIDLow},
 	}
 	for _, e := range extras {
-		v, err := d.read(e.opcode)
+		v, err := d.conn.Read(e.opcode, d.timeout)
 		if err != nil {
 			warns = append(warns, fmt.Sprintf("%s: %v", e.name, err))
 			continue
@@ -122,4 +128,93 @@ func (d *Device) ReadInfo() (Info, []string, error) {
 		*e.target = v
 	}
 	return info, warns, nil
+}
+
+// Move executes a single point-to-position transition. The full sequence
+// mirrors com/zhiyun/device/a.java:93 → d(a, q1):
+//
+//	SET_BUTTON_EVENT(0x18)
+//	LOCATION_SET_POINT_POWERED(1)
+//	LOCATION_POINT_CONTROLLER(0)
+//	[PITCH|ROLL|YAW]_ROTATE_ANGLE(deg × 100)   — per non-nil axis
+//	POINT_MOTION_TIME_LOW_BIT / _HIGH_BIT
+//	LOCATION_POINT_CONTROLLER(1)               — GO trigger
+//	poll LOCATION_POINT_STATE_REGISTER bit 2
+//	LOCATION_SET_POINT_POWERED(0)
+func (d *Device) Move(mp MoveParams) error {
+	if mp.Yaw == nil && mp.Roll == nil && mp.Pitch == nil {
+		return errors.New("move: no axis specified")
+	}
+	t := mp.Time
+	if t == 0 {
+		t = DefaultMotionTimeMS
+	}
+
+	w := func(opcode uint16, param uint16, label string) error {
+		if err := d.conn.Write(opcode, param, d.timeout); err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		return nil
+	}
+
+	if err := w(protocol.OpcodeSetButtonEvent, 0x18, "set-button-event"); err != nil {
+		return err
+	}
+	if err := w(protocol.OpcodeLocationSetPointPowered, 1, "set-point-power-on"); err != nil {
+		return err
+	}
+	if err := w(protocol.OpcodeLocationPointController, 0, "controller-arm"); err != nil {
+		return err
+	}
+
+	if mp.Pitch != nil {
+		if err := w(protocol.OpcodePitchRotateAngle, degToParam(*mp.Pitch), "pitch"); err != nil {
+			return err
+		}
+	}
+	if mp.Roll != nil {
+		if err := w(protocol.OpcodeRollRotateAngle, degToParam(*mp.Roll), "roll"); err != nil {
+			return err
+		}
+	}
+	if mp.Yaw != nil {
+		if err := w(protocol.OpcodeYawRotateAngle, degToParam(*mp.Yaw), "yaw"); err != nil {
+			return err
+		}
+	}
+
+	if err := w(protocol.OpcodeMotionTimeLow, uint16(t&0xFFFF), "motion-time-low"); err != nil {
+		return err
+	}
+	if err := w(protocol.OpcodeMotionTimeHigh, uint16((t>>16)&0xFF), "motion-time-high"); err != nil {
+		return err
+	}
+	if err := w(protocol.OpcodeLocationPointController, 1, "controller-go"); err != nil {
+		return err
+	}
+
+	d.waitMoveDone(t)
+	return w(protocol.OpcodeLocationSetPointPowered, 0, "set-point-power-off")
+}
+
+// waitMoveDone waits out the motion envelope. The app gates completion on
+// bit 2 of LOCATION_POINT_STATE_REGISTER (cc/of.java:207 via n4.java), but a
+// plain read of that register stays at 0x0052 and never sets it, so we cannot
+// rely on it: the move is effectively open-loop on the motion-time. We poll
+// best-effort to break out early if the bit ever appears, and otherwise
+// settle for motionTime + a short grace. Never returns an error.
+func (d *Device) waitMoveDone(motionMS uint32) {
+	deadline := time.Now().Add(time.Duration(motionMS)*time.Millisecond + 300*time.Millisecond)
+	for time.Now().Before(deadline) {
+		if v, err := d.conn.Read(protocol.OpcodeLocationPointStateRegister, d.timeout); err == nil && (v&0x04) != 0 {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// degToParam converts signed degrees to the wire uint16 the gimbal expects
+// (Stabilizer.p8 at line 2420 does Math.round(deg * 100.0f)).
+func degToParam(deg float64) uint16 {
+	return uint16(int16(math.Round(deg * 100.0)))
 }
