@@ -59,3 +59,13 @@ const (
 	FunctionBackCenter uint16 = 0 // gimbal home (matches trigger double-click)
 	FunctionBackHead   uint16 = 1 // turn to face user
 )
+
+// — Fine-tune trim (com/zhiyun/protocol/constants/InteractCode.java) —
+// Gravity-referenced angular offsets (short, /100 = degrees) that redefine
+// "level" per axis. Absolute values. No yaw trim (no gravity reference).
+var (
+	OpcodePitchFineTuneR = Opcode(0, 1, 37)   // 0x0025
+	OpcodePitchFineTuneW = Opcode(128, 1, 37) // 0x8025
+	OpcodeRollFineTuneR  = Opcode(0, 1, 38)   // 0x0026
+	OpcodeRollFineTuneW  = Opcode(128, 1, 38) // 0x8026
+)

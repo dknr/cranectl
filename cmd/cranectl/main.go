@@ -56,6 +56,8 @@ func main() {
 		infoCmd(mac, os.Args[3:])
 	case "move":
 		moveCmd(mac, os.Args[3:])
+	case "trim":
+		trimCmd(mac, os.Args[3:])
 	default:
 		fail("unknown command %q (expected 'info' or 'move')", os.Args[2])
 	}
@@ -66,6 +68,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  cranectl scan [--timeout 5s]")
 	fmt.Fprintln(os.Stderr, "  cranectl <MAC> info [--debug]")
 	fmt.Fprintln(os.Stderr, "  cranectl <MAC> move <panDeg> <tiltDeg> [--roll N] [--time ms] [--debug]")
+	fmt.Fprintln(os.Stderr, "  cranectl <MAC> trim [<pitchDeg> <rollDeg>] [--debug]")
 }
 
 func scanCmd(args []string) {
@@ -243,6 +246,54 @@ func moveCmd(mac string, args []string) {
 		fmt.Printf("moved to pan=%+.1f° tilt=%+.1f° (%d ms); measured pan=%+.2f° tilt=%+.2f°\n",
 			pan, tilt, timeVal, yaw, pitch)
 	}
+}
+
+// trimCmd gets or sets the pitch/roll fine-tune offsets. No args → get. Two
+// positional degrees → absolute set (raw register polarity).
+func trimCmd(mac string, args []string) {
+	var debug bool
+	var positional []string
+	for _, a := range args {
+		switch a {
+		case "--debug", "-debug":
+			debug = true
+		default:
+			positional = append(positional, a)
+		}
+	}
+
+	dev, err := gimbal.Connect(mac)
+	if err != nil {
+		fail("connect %s: %v", mac, err)
+	}
+	defer dev.Close()
+	dev.SetDebug(debug)
+
+	switch len(positional) {
+	case 0:
+		pitch, roll, err := dev.FineTune()
+		if err != nil {
+			fail("read fine-tune: %v", err)
+		}
+		fmt.Printf("pitch=%+.2f° roll=%+.2f°\n", pitch, roll)
+	case 2:
+		pitch := parseDegArg(positional[0])
+		roll := parseDegArg(positional[1])
+		if err := dev.SetFineTune(pitch, roll); err != nil {
+			fail("set fine-tune: %v", err)
+		}
+		fmt.Printf("set pitch=%+.2f° roll=%+.2f°\n", pitch, roll)
+	default:
+		fail("usage: cranectl <MAC> trim [<pitchDeg> <rollDeg>]")
+	}
+}
+
+func parseDegArg(s string) float64 {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		fail("bad angle %q: %v", s, err)
+	}
+	return v
 }
 
 func hasPrefixAny(s string, prefixes ...string) bool {

@@ -160,6 +160,36 @@ func (d *Device) CameraPhoto() error {
 	return nil
 }
 
+// FineTune reads the current pitch/roll fine-tune offsets (gravity-referenced
+// "level" redefinition), in degrees.
+func (d *Device) FineTune() (pitch, roll float64, err error) {
+	if pitch, err = d.readFineTune(protocol.OpcodePitchFineTuneR); err != nil {
+		return
+	}
+	roll, err = d.readFineTune(protocol.OpcodeRollFineTuneR)
+	return
+}
+
+func (d *Device) readFineTune(opcode uint16) (float64, error) {
+	v, err := d.conn.Read(opcode, d.timeout)
+	if err != nil {
+		return 0, err
+	}
+	return float64(int16(v)) / 100.0, nil
+}
+
+// SetFineTune writes absolute pitch/roll fine-tune offsets in degrees (raw
+// register polarity, deg×100).
+func (d *Device) SetFineTune(pitchDeg, rollDeg float64) error {
+	if err := d.conn.Write(protocol.OpcodePitchFineTuneW, degToParam(pitchDeg), d.timeout); err != nil {
+		return fmt.Errorf("pitch-fine-tune: %w", err)
+	}
+	if err := d.conn.Write(protocol.OpcodeRollFineTuneW, degToParam(rollDeg), d.timeout); err != nil {
+		return fmt.Errorf("roll-fine-tune: %w", err)
+	}
+	return nil
+}
+
 // Home issues the gimbal's own recenter (FUNCTION_EVENT BACK_CENTER), which
 // drives the motors to the gimbal's stored neutral — the same physical
 // position as a trigger double-click. Note this is NOT the firmware readback
