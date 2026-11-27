@@ -13,6 +13,12 @@ var (
 
 	OpcodeBattery = Opcode(0, 1, 6)
 
+	// Live attitude (int16 param, /100 = degrees; see cc/n5.java). Same
+	// reference frame the *_ROTATE_ANGLE_CONTROL writes target.
+	OpcodePitchAngleR = Opcode(0, 1, 34)
+	OpcodeRollAngleR  = Opcode(0, 1, 35)
+	OpcodeYawAngleR   = Opcode(0, 1, 36)
+
 	OpcodeIMUBootAdr        = Opcode(192, 1, 16)
 	OpcodeIMUMachineVersion = Opcode(192, 1, 17)
 	OpcodeIMUBootVersion    = Opcode(192, 1, 18)

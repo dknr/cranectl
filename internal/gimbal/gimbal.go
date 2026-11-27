@@ -193,24 +193,112 @@ func (d *Device) Move(mp MoveParams) error {
 		return err
 	}
 
-	d.waitMoveDone(t)
+	if err := d.waitMoveDone(mp); err != nil {
+		_ = w(protocol.OpcodeLocationSetPointPowered, 0, "set-point-power-off")
+		return err
+	}
 	return w(protocol.OpcodeLocationSetPointPowered, 0, "set-point-power-off")
 }
 
-// waitMoveDone waits out the motion envelope. The app gates completion on
-// bit 2 of LOCATION_POINT_STATE_REGISTER (cc/of.java:207 via n4.java), but a
-// plain read of that register stays at 0x0052 and never sets it, so we cannot
-// rely on it: the move is effectively open-loop on the motion-time. We poll
-// best-effort to break out early if the bit ever appears, and otherwise
-// settle for motionTime + a short grace. Never returns an error.
-func (d *Device) waitMoveDone(motionMS uint32) {
-	deadline := time.Now().Add(time.Duration(motionMS)*time.Millisecond + 300*time.Millisecond)
-	for time.Now().Before(deadline) {
-		if v, err := d.conn.Read(protocol.OpcodeLocationPointStateRegister, d.timeout); err == nil && (v&0x04) != 0 {
-			return
-		}
-		time.Sleep(300 * time.Millisecond)
+// Closed-loop settle parameters. The gimbal is an active stabilizer, so it
+// holds a commanded attitude with small jitter; we require the live angle to
+// stay within SettleTolerance of the target for SettleSamples consecutive
+// polls before declaring the move complete.
+const (
+	SettleTolerance = 1.0 // degrees
+	SettleSamples   = 3   // consecutive in-window reads
+	SettlePollEvery = 80 * time.Millisecond
+	SettleGrace     = 3 * time.Second // added to motion envelope as a cap
+)
+
+// waitMoveDone is the definitive completion gate. It polls the live attitude
+// (YAW/PITCH/ROLL_ANGLE_R) and returns once every commanded axis is within
+// SettleTolerance of its target for SettleSamples consecutive samples. If the
+// gimbal has not settled by motionTime + SettleGrace it returns an error
+// carrying the last observed angles, so "done" always means physically at
+// target — never just "the envelope elapsed".
+func (d *Device) waitMoveDone(mp MoveParams) error {
+	motion := mp.Time
+	if motion == 0 {
+		motion = DefaultMotionTimeMS
 	}
+	deadline := time.Now().Add(time.Duration(motion)*time.Millisecond + SettleGrace)
+
+	type axis struct {
+		target   float64
+		opcode   uint16
+		inWindow int
+	}
+	var axes []axis
+	if mp.Yaw != nil {
+		axes = append(axes, axis{target: *mp.Yaw, opcode: protocol.OpcodeYawAngleR})
+	}
+	if mp.Pitch != nil {
+		axes = append(axes, axis{target: *mp.Pitch, opcode: protocol.OpcodePitchAngleR})
+	}
+	if mp.Roll != nil {
+		axes = append(axes, axis{target: *mp.Roll, opcode: protocol.OpcodeRollAngleR})
+	}
+
+	last := make([]float64, len(axes))
+	var lastErr error
+	for {
+		allSettled := true
+		for i := range axes {
+			v, err := d.conn.Read(axes[i].opcode, d.timeout)
+			if err != nil {
+				lastErr = err
+				allSettled = false
+				axes[i].inWindow = 0
+				continue
+			}
+			lastErr = nil
+			deg := float64(int16(v)) / 100.0
+			last[i] = deg
+			if math.Abs(deg-axes[i].target) <= SettleTolerance {
+				axes[i].inWindow++
+			} else {
+				axes[i].inWindow = 0
+			}
+			if axes[i].inWindow < SettleSamples {
+				allSettled = false
+			}
+		}
+		if allSettled {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("settle: %w", lastErr)
+			}
+			msg := "settle timeout, last angles:"
+			for i := range axes {
+				msg += fmt.Sprintf(" %+.2f°(want %+.2f°)", last[i], axes[i].target)
+			}
+			return errors.New(msg)
+		}
+		time.Sleep(SettlePollEvery)
+	}
+}
+
+// Angles reads the live pan/tilt/roll attitude in degrees.
+func (d *Device) Angles() (yaw, pitch, roll float64, err error) {
+	if yaw, err = d.readAngle(protocol.OpcodeYawAngleR); err != nil {
+		return
+	}
+	if pitch, err = d.readAngle(protocol.OpcodePitchAngleR); err != nil {
+		return
+	}
+	roll, err = d.readAngle(protocol.OpcodeRollAngleR)
+	return
+}
+
+func (d *Device) readAngle(opcode uint16) (float64, error) {
+	v, err := d.conn.Read(opcode, d.timeout)
+	if err != nil {
+		return 0, err
+	}
+	return float64(int16(v)) / 100.0, nil
 }
 
 // degToParam converts signed degrees to the wire uint16 the gimbal expects

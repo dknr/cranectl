@@ -227,11 +227,21 @@ func moveCmd(mac string, args []string) {
 	}); err != nil {
 		fail("%v", err)
 	}
+	yaw, pitch, ro, aerr := dev.Angles()
+	if aerr != nil {
+		if roll != nil {
+			fmt.Printf("moved pan=%+.1f° tilt=%+.1f° roll=%+.1f° (%d ms)\n", pan, tilt, *roll, timeVal)
+		} else {
+			fmt.Printf("moved pan=%+.1f° tilt=%+.1f° (%d ms)\n", pan, tilt, timeVal)
+		}
+		return
+	}
 	if roll != nil {
-		fmt.Printf("moved pan=%+.1f° tilt=%+.1f° roll=%+.1f° (%d ms)\n",
-			pan, tilt, *roll, timeVal)
+		fmt.Printf("moved to pan=%+.1f° tilt=%+.1f° roll=%+.1f° (%d ms); measured pan=%+.2f° tilt=%+.2f° roll=%+.2f°\n",
+			pan, tilt, *roll, timeVal, yaw, pitch, ro)
 	} else {
-		fmt.Printf("moved pan=%+.1f° tilt=%+.1f° (%d ms)\n", pan, tilt, timeVal)
+		fmt.Printf("moved to pan=%+.1f° tilt=%+.1f° (%d ms); measured pan=%+.2f° tilt=%+.2f°\n",
+			pan, tilt, timeVal, yaw, pitch)
 	}
 }
 
