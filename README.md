@@ -95,14 +95,26 @@ soft reset. Axes are never silently wrapped.
 
 ### Two "centers"
 
-- **Gimbal home** — `G28` (and the physical trigger double-click). The pan axis
-  typically sits ≈ −18° here in firmware coordinates; this is the meaningful
-  reference and the one `G28` adopts as origin.
+- **Gimbal home** — `G28` (and the physical trigger double-click). Tilt and roll
+  home is stable (gravity-referenced); the pan axis has no absolute reference,
+  so `G28` re-zeros pan wherever it happens to sit (it can land anywhere). What
+  matters is that `G28` captures the resulting pose as the **origin**, so user
+  `0,0` is always that home pose. `?` always reports the true measured `Pos:`.
 - **Firmware datum** — readback coordinate `0,0`. Reach it explicitly with
   `G53 X0 Y0`. Useful for calibration work.
 
 The `?` real-time command reports both: `MPos:` is the user (origin-relative)
 position you programmed, `Pos:` is the measured firmware attitude.
+
+### Example program
+
+`examples/reveal-demo.g` is a short cinematic shot that exercises the whole
+set — `G28` home, feedrate moves (`F`), dwell (`G4`), relative moves (`G91`),
+rapid (`G0`), machine coords (`G53`), and a datum shift (`G92`):
+
+```sh
+cat examples/reveal-demo.g > /path/to/cranectld.fifo
+```
 
 ## Safety
 
