@@ -1,13 +1,15 @@
 // cranectld — long-running G-code daemon for a CRANEM2S gimbal.
 //
 // It owns a single persistent BLE connection and drains G-code lines from a
-// named pipe (FIFO), mapping each motion block to the closed-loop move
-// sequence. GRBL-style real-time commands are handled immediately:
+// named pipe (FIFO). Coordinate resolution (origin, feedrate, abs/relative)
+// happens sequentially in the executor, so a move reflects the coordinate
+// state in effect at execution time. GRBL-style real-time commands are handled
+// immediately:
 //
-//	?       report state + measured position
+//	?       report state + user and measured position
 //	!       feed hold (stop dequeue)
 //	~       resume from hold
-//	^X      soft reset (drain queue, clear hold/fault)
+//	^X/RESET soft reset (drain queue, clear hold/fault)
 //
 // Responses (ok / error:<n> / status) go to stdout (redirect to a log).
 //
@@ -24,6 +26,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -32,11 +35,17 @@ import (
 	"cranectl/internal/gimbal"
 )
 
+// homeSettle is how long to wait for the gimbal to reach its physical home
+// (BACK_CENTER) before reading the pose and adopting it as the origin.
+const homeSettle = 3 * time.Second
+
 type state struct {
 	hold    int32
 	fault   int32
 	resetRe int32
 }
+
+var macRe = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
 
 func main() {
 	var (
@@ -54,8 +63,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: cranectld <MAC> [--pipe PATH] [flags]  (see --help)")
 		flag.PrintDefaults()
 	}
-	// MAC-first: pull the MAC out before flag parsing (stdlib flag stops at the
-	// first positional), then parse flags from the remainder.
 	mac, rest := extractMAC(os.Args[1:])
 	flag.CommandLine.Parse(rest)
 	if mac == "" || flag.NArg() != 0 {
@@ -63,7 +70,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Connect once and keep the link alive.
 	dev, err := gimbal.Connect(mac)
 	if err != nil {
 		logf("fatal: connect %s: %v", mac, err)
@@ -72,9 +78,9 @@ func main() {
 	defer dev.Close()
 
 	lim := gcode.Limits{Pan: *panLim, Tilt: *tiltLim, Roll: *rollLim}
-	parser := gcode.NewParser(lim, *defTime, *minTime, *maxTime)
+	ctl := gcode.NewController(lim, *defTime, *minTime, *maxTime)
 	if *feedDef > 0 {
-		parser.Parse(fmt.Sprintf("G1 X0 F%.4g", *feedDef)) // seed modal feed without moving
+		ctl.SetFeed(*feedDef)
 	}
 
 	pipeFile, err := openFIFO(*pipe)
@@ -92,10 +98,9 @@ func main() {
 	}
 
 	var st state
-	cmdCh := make(chan gcode.Command, 10000)
+	var mu sync.Mutex
+	cmdCh := make(chan gcode.Action, 10000)
 
-	// SIGINT/SIGTERM -> clean shutdown (every executing move disarms on its
-	// own; the executor's deferred cleanup closes the link).
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -108,23 +113,27 @@ func main() {
 		os.Exit(0)
 	}()
 
-	go executor(dev, &st, cmdCh)
-	reader(pipeFile, dev, parser, &st, cmdCh, mac, lim)
+	go executor(dev, &st, &mu, ctl, cmdCh)
+	reader(pipeFile, dev, &mu, ctl, &st, cmdCh, mac, lim)
 }
 
-// executor owns the connection and runs queued commands, single-threaded.
-func executor(dev *gimbal.Device, st *state, ch <-chan gcode.Command) {
-	var pending *gcode.Command
+// executor owns the connection and the controller, running one command at a
+// time (sequential resolution of the origin/feed state).
+func executor(dev *gimbal.Device, st *state, mu *sync.Mutex, ctl *gcode.Controller, ch <-chan gcode.Action) {
+	var pending *gcode.Action
 	held := func() bool {
 		return atomic.LoadInt32(&st.hold) == 1 || atomic.LoadInt32(&st.fault) == 1
 	}
+	reset := func() {
+		drain(ch)
+		pending = nil
+		atomic.StoreInt32(&st.fault, 0)
+		atomic.StoreInt32(&st.hold, 0)
+		logf("reset")
+	}
 	for {
 		if atomic.SwapInt32(&st.resetRe, 0) == 1 {
-			drain(ch)
-			pending = nil
-			atomic.StoreInt32(&st.fault, 0)
-			atomic.StoreInt32(&st.hold, 0)
-			logf("reset")
+			reset()
 			continue
 		}
 		if held() {
@@ -133,87 +142,107 @@ func executor(dev *gimbal.Device, st *state, ch <-chan gcode.Command) {
 		}
 		if pending == nil {
 			select {
-			case c := <-ch:
-				cc := c
-				pending = &cc
+			case a := <-ch:
+				aa := a
+				pending = &aa
 			case <-time.After(50 * time.Millisecond):
 				continue
 			}
 		}
-		// A reset or hold may have arrived while we waited to acquire pending.
 		if atomic.SwapInt32(&st.resetRe, 0) == 1 {
-			drain(ch)
-			pending = nil
-			atomic.StoreInt32(&st.fault, 0)
-			atomic.StoreInt32(&st.hold, 0)
-			logf("reset")
+			reset()
 			continue
 		}
 		if held() {
 			continue // keep pending, wait for resume/reset
 		}
-		run(dev, st, *pending)
+		// Resolve against current controller state, sequentially.
+		mu.Lock()
+		plan := ctl.Plan(*pending)
+		mu.Unlock()
 		pending = nil
+		run(dev, st, mu, ctl, plan)
 	}
 }
 
-func run(dev *gimbal.Device, st *state, cmd gcode.Command) {
-	switch cmd.Kind {
-	case gcode.KindMove:
-		if !cmd.MovedAny {
+func run(dev *gimbal.Device, st *state, mu *sync.Mutex, ctl *gcode.Controller, p gcode.Plan) {
+	if p.Err != nil {
+		logf("error: %v", p.Err)
+		atomic.StoreInt32(&st.fault, 1)
+		atomic.StoreInt32(&st.hold, 1)
+		return
+	}
+	switch p.Kind {
+	case gcode.KindMotion:
+		if !p.MovedAny {
 			logf("ok")
 			return
 		}
-		mp := gcodeToParams(cmd)
-		if err := dev.Move(mp); err != nil {
+		if err := dev.Move(planToParams(p)); err != nil {
 			logf("error: %v", err)
 			atomic.StoreInt32(&st.fault, 1)
 			atomic.StoreInt32(&st.hold, 1)
 			return
 		}
 		logf("ok")
+	case gcode.KindHome:
+		if err := dev.Home(); err != nil {
+			logf("error: %v", err)
+			atomic.StoreInt32(&st.fault, 1)
+			atomic.StoreInt32(&st.hold, 1)
+			return
+		}
+		time.Sleep(homeSettle)
+		y, pt, r, err := dev.Angles()
+		if err != nil {
+			logf("error: home readback: %v", err)
+			atomic.StoreInt32(&st.fault, 1)
+			atomic.StoreInt32(&st.hold, 1)
+			return
+		}
+		mu.Lock()
+		ctl.SetOriginFromMeasured(y, pt, r)
+		mu.Unlock()
+		logf("ok (home: origin pan=%+.2f tilt=%+.2f roll=%+.2f)", y, pt, r)
 	case gcode.KindDwell:
-		time.Sleep(time.Duration(cmd.DwellMS) * time.Millisecond)
+		time.Sleep(time.Duration(p.DwellMS) * time.Millisecond)
 		logf("ok")
-	case gcode.KindProgramEnd:
+	case gcode.KindEnd:
 		logf("ok (program end)")
-	case gcode.KindSetDatum, gcode.KindIgnore:
-		// datum applied at parse time; nothing to do.
-	case gcode.KindError:
-		logf("error: %v", cmd.Err)
-		atomic.StoreInt32(&st.fault, 1)
-		atomic.StoreInt32(&st.hold, 1)
+	case gcode.KindIgnore:
+		// modal / no-op
 	}
 }
 
-func gcodeToParams(cmd gcode.Command) gimbal.MoveParams {
-	mp := gimbal.MoveParams{Time: uint32(cmd.TimeMS)}
-	if cmd.HasX {
-		v := cmd.X
+func planToParams(p gcode.Plan) gimbal.MoveParams {
+	mp := gimbal.MoveParams{Time: uint32(p.TimeMS)}
+	if p.HasX {
+		v := p.X
 		mp.Yaw = &v
 	}
-	if cmd.HasY {
-		v := cmd.Y
+	if p.HasY {
+		v := p.Y
 		mp.Pitch = &v
 	}
-	if cmd.HasZ {
-		v := cmd.Z
+	if p.HasZ {
+		v := p.Z
 		mp.Roll = &v
 	}
 	return mp
 }
 
-// reader parses lines into commands and handles real-time commands inline.
-func reader(f *os.File, dev *gimbal.Device, parser *gcode.Parser, st *state, ch chan<- gcode.Command, mac string, lim gcode.Limits) {
+// reader lexes lines into actions and handles real-time commands inline.
+func reader(f *os.File, dev *gimbal.Device, mu *sync.Mutex, ctl *gcode.Controller, st *state, ch chan<- gcode.Action, mac string, lim gcode.Limits) {
+	var lx gcode.Lexer
 	logf("ready: mac=%s pan=±%.0f tilt=±%.0f roll=±%.0f", mac, lim.Pan, lim.Tilt, lim.Roll)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 4096), 64*1024)
 	for sc.Scan() {
 		line := sc.Text()
-		if realtime(strings.TrimSpace(line), dev, parser, st) {
+		if realtime(strings.TrimSpace(line), dev, mu, ctl, st) {
 			continue
 		}
-		ch <- parser.Parse(line)
+		ch <- lx.Parse(line)
 	}
 	if err := sc.Err(); err != nil {
 		logf("fifo read error: %v", err)
@@ -221,14 +250,17 @@ func reader(f *os.File, dev *gimbal.Device, parser *gcode.Parser, st *state, ch 
 }
 
 // realtime handles immediate commands; returns true if the line was one.
-func realtime(t string, dev *gimbal.Device, parser *gcode.Parser, st *state) bool {
+func realtime(t string, dev *gimbal.Device, mu *sync.Mutex, ctl *gcode.Controller, st *state) bool {
 	switch {
 	case t == "?" || strings.EqualFold(t, "STATUS"):
-		x, y, z := parser.Position()
-		if ax, ay, az, err := dev.Angles(); err == nil {
-			x, y, z = ax, ay, az
-		}
-		logf("<%s,MPos:%.2f,%.2f,%.2f>", stateName(st), x, y, z)
+		ux, uy, uz := func() (float64, float64, float64) {
+			mu.Lock()
+			defer mu.Unlock()
+			return ctl.Position()
+		}()
+		mx, my, mz, _ := dev.Angles()
+		logf("<%s,MPos:%.2f,%.2f,%.2f|Pos:%.2f,%.2f,%.2f>",
+			stateName(st), ux, uy, uz, mx, my, mz)
 		return true
 	case t == "!":
 		atomic.StoreInt32(&st.hold, 1)
@@ -256,7 +288,7 @@ func stateName(st *state) string {
 	}
 }
 
-func drain(ch <-chan gcode.Command) {
+func drain(ch <-chan gcode.Action) {
 	for {
 		select {
 		case <-ch:
@@ -279,10 +311,6 @@ func openFIFO(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDWR, 0o644)
 }
 
-var macRe = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
-
-// extractMAC removes and returns the first MAC-looking token, keeping the
-// remaining args in order for flag parsing.
 func extractMAC(args []string) (string, []string) {
 	mac := ""
 	out := make([]string, 0, len(args))

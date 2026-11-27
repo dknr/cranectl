@@ -60,8 +60,8 @@ Example `shot.g`:
 
 ```gcode
 G90                 ; absolute positioning
-G28                 ; home to 0/0
-G1 Y-20 T2000       ; tilt down 20 deg in 2s
+G28                 ; gimbal home (becomes user 0,0)
+G1 Y-20 T2000       ; tilt down 20 deg in 2s (from home)
 G4 P300             ; dwell 300 ms
 G1 X30 Y30 T15000   ; coordinated pan + tilt-up over 15s
 M2                  ; program end
@@ -71,14 +71,19 @@ M2                  ; program end
 
 Coordinates are **degrees**: `X` = pan/yaw, `Y` = tilt/pitch, `Z` = roll.
 
+Absolute moves are in a **user frame** relative to a settable origin. Homing
+(`G28`) drives the gimbal to its physical home (same as a trigger double-click)
+and makes that pose the origin — so right after `G28`, `G1 X0 Y0` *is* home.
+
 | Code | Meaning |
 |------|---------|
 | `G0 X_ Y_ Z_` | rapid move (minimum motion time) |
 | `G1 X_ Y_ Z_ [F_] \| [T_]` | controlled move; `F` = feedrate (deg/min), `T` = explicit time (ms) |
 | `G4 P<ms>` | dwell |
-| `G28` | home to 0/0 |
-| `G90` / `G91` | absolute (default) / relative |
-| `G92 X_ Y_ Z_` | set datum without moving |
+| `G28` | gimbal home (`BACK_CENTER`) and define the origin there |
+| `G53 X_ Y_ Z_` | move in raw firmware/machine coordinates (ignores the origin) |
+| `G90` / `G91` | absolute (default) / relative (user frame) |
+| `G92 X_ Y_ Z_` | redefine the current position (shifts the origin) |
 | `G20` / `G21` | accepted, ignored (units are always degrees) |
 | `M2` / `M30` | program end |
 | `;` … / `(...)` | comments |
@@ -87,6 +92,17 @@ Coordinates are **degrees**: `X` = pan/yaw, `Y` = tilt/pitch, `Z` = roll.
 Anything else — unknown words, unsupported codes, or out-of-range axes — is
 **rejected** with an `error:` and puts the daemon into an `Alarm` state until a
 soft reset. Axes are never silently wrapped.
+
+### Two "centers"
+
+- **Gimbal home** — `G28` (and the physical trigger double-click). The pan axis
+  typically sits ≈ −18° here in firmware coordinates; this is the meaningful
+  reference and the one `G28` adopts as origin.
+- **Firmware datum** — readback coordinate `0,0`. Reach it explicitly with
+  `G53 X0 Y0`. Useful for calibration work.
+
+The `?` real-time command reports both: `MPos:` is the user (origin-relative)
+position you programmed, `Pos:` is the measured firmware attitude.
 
 ## Safety
 

@@ -1,11 +1,17 @@
 // Package gcode implements a minimal G-code interpreter for gimbal motion.
 //
 // Coordinate model (degrees): X=pan/yaw, Y=tilt/pitch, Z=roll.
-// Supported: G0/G1 motion (F feedrate deg/min or T ms), G4 P dwell, G28 home,
-// G90/G91 abs/relative, G92 set-datum, G20/G21 no-op, M2/M30 program end,
-// comments (; and ()), line numbers (N). Anything else is reported as an
-// error rather than silently ignored, so typos surface instead of being
-// dropped.
+//
+// Two frames are involved:
+//   - firmware/machine frame: what the *_ROTATE_ANGLE writes and *_ANGLE_R
+//     reads use. Fixed to the gimbal's internal datum.
+//   - user frame: absolute G1 targets are relative to a settable origin.
+//     Homing (G28 → FUNCTION_EVENT BACK_CENTER) drives the gimbal to its
+//     physical home and defines the origin, so after G28 "X0 Y0" IS home.
+//
+// Parsing is a pure lexing step (Lexer). Coordinate resolution happens later,
+// sequentially, in the Controller — so a move's coordinates reflect the origin
+// in effect at execution time (e.g. right after a G28).
 package gcode
 
 import (
@@ -17,96 +23,81 @@ import (
 	"strings"
 )
 
-// Kind classifies a parsed line.
+// Kind classifies a lexed action / plan step.
 type Kind int
 
 const (
-	KindIgnore     Kind = iota // comment / blank
-	KindMove                   // G0/G1 (or bare X/Y/Z)
-	KindDwell                  // G4 P<ms>
-	KindHome                   // G28
-	KindSetDatum               // G92
-	KindProgramEnd             // M2/M30
-	KindError                  // rejected
+	KindIgnore Kind = iota
+	KindMotion      // G0/G1 (or bare X/Y/Z); G53 sets Machine
+	KindDwell       // G4 P<ms>
+	KindHome        // G28 (gimbal home / BACK_CENTER)
+	KindSetPos      // G92
+	KindAbs         // G90/G91 (modal)
+	KindEnd         // M2/M30
 )
 
-// Limits are the per-axis ±degrees the gimbal accepts. Moves beyond these are
-// rejected (never silently wrapped).
-type Limits struct {
-	Pan, Tilt, Roll float64
+// Action is one lexed line, before coordinate resolution.
+type Action struct {
+	Kind             Kind
+	Err              error
+	X, Y, Z          float64
+	HasX, HasY, HasZ bool
+	Rapid            bool    // G0
+	Machine          bool    // G53 (raw firmware coords)
+	Absolute         bool    // for KindAbs: true=G90 false=G91
+	Feed             float64 // F value (0 = none)
+	TimeMS           int
+	HaveTime         bool
+	DwellMS          int
 }
 
-// Command is one parsed line's result.
-type Command struct {
-	Kind Kind
-	Err  error
-
-	// motion (absolute degrees, fully resolved)
-	X, Y, Z  float64
-	HasX     bool
-	HasY     bool
-	HasZ     bool
-	Rapid    bool
-	TimeMS   int
-	MovedAny bool
-
-	// dwell
-	DwellMS int
+// Plan is a resolved action ready to execute.
+type Plan struct {
+	Kind             Kind
+	Err              error
+	X, Y, Z          float64
+	HasX, HasY, HasZ bool
+	MovedAny         bool
+	TimeMS           int
+	DwellMS          int
 }
+
+// Limits are per-axis ±degrees (firmware frame). Moves beyond these are
+// rejected, never silently wrapped.
+type Limits struct{ Pan, Tilt, Roll float64 }
 
 var (
 	wordRe  = regexp.MustCompile(`(?i)([A-Za-z])([-+]?[0-9]*\.?[0-9]+)`)
 	blockRe = regexp.MustCompile(`\([^)]*\)`)
 )
 
-// Parser holds modal state across lines. It is NOT safe for concurrent use;
-// the daemon runs a single reader goroutine over it.
-type Parser struct {
-	abs              bool
-	feed             float64 // deg/min, modal
-	defTime          int     // ms used when no F/T given
-	minTime          int     // ms floor
-	maxTime          int     // ms ceiling
-	curX, curY, curZ float64
-	lim              Limits
-}
+// Lexer turns lines into Actions. Stateless; safe to keep in one goroutine.
+type Lexer struct{}
 
-// NewParser returns a parser defaulting to absolute positioning.
-func NewParser(lim Limits, defTime, minTime, maxTime int) *Parser {
-	return &Parser{abs: true, defTime: defTime, minTime: minTime, maxTime: maxTime, lim: lim}
-}
-
-// SetPosition overrides the datum without moving (G92).
-func (p *Parser) SetPosition(x, y, z float64) { p.curX, p.curY, p.curZ = x, y, z }
-
-// Position returns the last commanded absolute pose.
-func (p *Parser) Position() (x, y, z float64) { return p.curX, p.curY, p.curZ }
-
-// Parse sanitizes comments and returns the Command for a single line.
-func (p *Parser) Parse(line string) Command {
+// Parse lexes a single line (stripping ';' and '(...)' comments).
+func (Lexer) Parse(line string) Action {
 	s := sanitize(line)
 	if s == "" {
-		return Command{Kind: KindIgnore}
+		return Action{Kind: KindIgnore}
 	}
 	words := wordRe.FindAllStringSubmatch(s, -1)
 	if len(words) == 0 {
-		return Command{Kind: KindError, Err: errors.New("unparseable line")}
+		return Action{Kind: KindIgnore, Err: errors.New("unparseable line")}
 	}
 
 	var (
-		gs, ms           []int
-		x, y, z          float64
-		hasX, hasY, hasZ bool
-		f                float64
-		t                int
-		p_               int // G4 P
-		haveT            bool
+		a      Action
+		gs, ms []int
+		f      float64
+		t      int
+		haveT  bool
+		p_     int
 	)
 	for _, w := range words {
 		letter := strings.ToUpper(w[1])
 		val, err := strconv.ParseFloat(w[2], 64)
 		if err != nil {
-			return Command{Kind: KindError, Err: fmt.Errorf("bad value %q", w[0])}
+			return Action{Err: fmt.Errorf("bad value %q", w[0])}
 		}
 		switch letter {
 		case "G":
@@ -114,11 +105,11 @@ func (p *Parser) Parse(line string) Command {
 		case "M":
 			ms = append(ms, int(val))
 		case "X":
-			x, hasX = val, true
+			a.X, a.HasX = val, true
 		case "Y":
-			y, hasY = val, true
+			a.Y, a.HasY = val, true
 		case "Z":
-			z, hasZ = val, true
+			a.Z, a.HasZ = val, true
 		case "F":
 			f = val
 		case "T":
@@ -126,140 +117,232 @@ func (p *Parser) Parse(line string) Command {
 		case "P":
 			p_ = int(val)
 		case "N", "S":
-			// line number / spindle speed: ignore
+			// ignore
 		default:
-			return Command{Kind: KindError, Err: fmt.Errorf("unknown word %q", w[0])}
+			return Action{Err: fmt.Errorf("unknown word %q", w[0])}
 		}
 	}
+	a.Feed, a.TimeMS, a.HaveTime = f, t, haveT
 
-	// Program / mode controls first.
 	for _, m := range ms {
 		switch m {
 		case 2, 30:
-			return Command{Kind: KindProgramEnd}
+			a.Kind = KindEnd
+			return a
 		default:
-			return Command{Kind: KindError, Err: fmt.Errorf("unsupported M%d", m)}
+			return Action{Err: fmt.Errorf("unsupported M%d", m)}
 		}
 	}
+
+	// Mode / control G-codes (mutually exclusive with motion in v1).
 	for _, g := range gs {
 		switch g {
 		case 90:
-			p.abs = true
+			return Action{Kind: KindAbs, Absolute: true}
 		case 91:
-			p.abs = false
+			return Action{Kind: KindAbs, Absolute: false}
 		case 20, 21:
-			// units: degrees regardless; accept+ignore
+			// units: accepted+ignored
 		case 92:
-			if hasX {
-				p.curX = x
-			}
-			if hasY {
-				p.curY = y
-			}
-			if hasZ {
-				p.curZ = z
-			}
-			return Command{Kind: KindSetDatum}
+			a.Kind = KindSetPos
+			return a
 		case 4:
 			if p_ <= 0 {
-				return Command{Kind: KindError, Err: errors.New("G4 requires P<ms>")}
+				return Action{Err: errors.New("G4 requires P<ms>")}
 			}
-			return Command{Kind: KindDwell, DwellMS: p_}
+			return Action{Kind: KindDwell, DwellMS: p_}
 		case 28:
-			return p.move(0, 0, 0, true, true, false, false, f, t, haveT)
-		case 0, 1:
-			// motion handled below (coordinates required)
+			return Action{Kind: KindHome}
+		case 53:
+			a.Kind, a.Machine = KindMotion, true
+		case 0:
+			a.Kind, a.Rapid = KindMotion, true
+		case 1:
+			a.Kind = KindMotion
 		default:
-			return Command{Kind: KindError, Err: fmt.Errorf("unsupported G%d", g)}
+			return Action{Err: fmt.Errorf("unsupported G%d", g)}
 		}
 	}
 
-	if !hasX && !hasY && !hasZ {
-		return Command{Kind: KindIgnore}
+	if !a.HasX && !a.HasY && !a.HasZ {
+		return Action{Kind: KindIgnore}
 	}
-	// Bare coordinates or a G0/G1: compute absolute targets + time.
-	tx, ty, tz := x, y, z
-	if !p.abs {
-		if hasX {
-			tx += p.curX
-		}
-		if hasY {
-			ty += p.curY
-		}
-		if hasZ {
-			tz += p.curZ
-		}
+	if a.Kind == 0 { // bare coordinates → linear move
+		a.Kind = KindMotion
 	}
-	rapid := len(gs) > 0 && gs[0] == 0
-	return p.move(tx, ty, tz, hasX, hasY, hasZ, rapid, f, t, haveT)
+	return a
 }
 
-// move validates axes, computes motion time, and updates the datum.
-func (p *Parser) move(tx, ty, tz float64, hx, hy, hz, rapid bool, f float64, t int, haveT bool) Command {
-	if hx && math.Abs(tx) > p.lim.Pan {
-		return Command{Kind: KindError, Err: fmt.Errorf("pan %.2f out of range ±%.1f", tx, p.lim.Pan)}
+// Controller resolves actions to plans using the current modal state and
+// origin. Not safe for concurrent use; the daemon's single executor owns it.
+type Controller struct {
+	lim                       Limits
+	defTime, minTime, maxTime int
+	abs                       bool
+	feed                      float64
+	ox, oy, oz                float64 // origin in firmware coords
+	px, py, pz                float64 // current position in user coords
+}
+
+// NewController returns a controller defaulting to absolute, origin at the
+// firmware datum (so pre-home, user frame == firmware frame).
+func NewController(lim Limits, defTime, minTime, maxTime int) *Controller {
+	return &Controller{lim: lim, defTime: defTime, minTime: minTime, maxTime: maxTime, abs: true}
+}
+
+// SetOriginFromMeasured adopts a measured firmware pose as the origin/user-zero
+// (called by the daemon after a G28 homing settles).
+func (c *Controller) SetOriginFromMeasured(yaw, pitch, roll float64) {
+	c.ox, c.oy, c.oz = yaw, pitch, roll
+	c.px, c.py, c.pz = 0, 0, 0
+}
+
+// Position returns the current user-frame position.
+func (c *Controller) Position() (x, y, z float64) { return c.px, c.py, c.pz }
+
+// Origin returns the current origin in firmware coords.
+func (c *Controller) Origin() (x, y, z float64) { return c.ox, c.oy, c.oz }
+
+// SetFeed seeds the modal feedrate (deg/min).
+func (c *Controller) SetFeed(f float64) { c.feed = f }
+
+// Plan resolves an action, updating modal state (abs/feed) as it goes.
+func (c *Controller) Plan(a Action) Plan {
+	switch a.Kind {
+	case KindIgnore:
+		return Plan{Kind: KindIgnore, Err: a.Err}
+	case KindEnd:
+		return Plan{Kind: KindEnd}
+	case KindDwell:
+		return Plan{Kind: KindDwell, DwellMS: a.DwellMS}
+	case KindAbs:
+		c.abs = a.Absolute
+		return Plan{Kind: KindIgnore}
+	case KindHome:
+		return Plan{Kind: KindHome}
+	case KindSetPos:
+		return c.planSetPos(a)
+	case KindMotion:
+		return c.planMotion(a)
 	}
-	if hy && math.Abs(ty) > p.lim.Tilt {
-		return Command{Kind: KindError, Err: fmt.Errorf("tilt %.2f out of range ±%.1f", ty, p.lim.Tilt)}
+	if a.Err != nil {
+		return Plan{Kind: KindIgnore, Err: a.Err}
 	}
-	if hz && math.Abs(tz) > p.lim.Roll {
-		return Command{Kind: KindError, Err: fmt.Errorf("roll %.2f out of range ±%.1f", tz, p.lim.Roll)}
+	return Plan{Kind: KindIgnore}
+}
+
+func (c *Controller) planSetPos(a Action) Plan {
+	// Redefine current position to (a.X,a.Y,a.Z); shift origin so the physical
+	// point is unchanged.
+	if a.HasX {
+		fwNow := c.ox + c.px
+		c.ox = fwNow - a.X
+		c.px = a.X
+	}
+	if a.HasY {
+		fwNow := c.oy + c.py
+		c.oy = fwNow - a.Y
+		c.py = a.Y
+	}
+	if a.HasZ {
+		fwNow := c.oz + c.pz
+		c.oz = fwNow - a.Z
+		c.pz = a.Z
+	}
+	return Plan{Kind: KindIgnore}
+}
+
+func (c *Controller) planMotion(a Action) Plan {
+	if a.Feed > 0 {
+		c.feed = a.Feed
+	}
+	fx, fy, fz := c.ox+c.px, c.oy+c.py, c.oz+c.pz
+	nx, ny, nz := c.px, c.py, c.pz
+
+	set := func(g float64, has, machine bool, origin, pos, lim float64) (fw, newUser float64, err error) {
+		if !has {
+			return origin + pos, pos, nil
+		}
+		if machine {
+			fw = g
+			newUser = g - origin
+		} else {
+			if c.abs {
+				newUser = g
+			} else {
+				newUser = pos + g
+			}
+			fw = origin + newUser
+		}
+		if math.Abs(fw) > lim {
+			return 0, 0, fmt.Errorf("axis %.2f out of range ±%.1f", fw, lim)
+		}
+		return fw, newUser, nil
 	}
 
-	// Feed modal: an explicit F updates it.
-	if f > 0 {
-		p.feed = f
+	var err error
+	if fx, nx, err = set(a.X, a.HasX, a.Machine, c.ox, c.px, c.lim.Pan); err != nil {
+		return Plan{Kind: KindIgnore, Err: err}
+	}
+	if fy, ny, err = set(a.Y, a.HasY, a.Machine, c.oy, c.py, c.lim.Tilt); err != nil {
+		return Plan{Kind: KindIgnore, Err: err}
+	}
+	if fz, nz, err = set(a.Z, a.HasZ, a.Machine, c.oz, c.pz, c.lim.Roll); err != nil {
+		return Plan{Kind: KindIgnore, Err: err}
 	}
 
-	// Motion time: rapid uses the floor; explicit T wins; else derive from
-	// feed + travel distance; else default.
+	// Motion time.
+	tm := c.timeFor(a, nx-c.px, ny-c.py, nz-c.pz)
+
+	// Commit user position for moved axes (machine moves recompute from fw).
+	if a.HasX {
+		c.px = nx
+	}
+	if a.HasY {
+		c.py = ny
+	}
+	if a.HasZ {
+		c.pz = nz
+	}
+	return Plan{
+		Kind: KindMotion,
+		X:    fx, Y: fy, Z: fz,
+		HasX: a.HasX, HasY: a.HasY, HasZ: a.HasZ,
+		MovedAny: a.HasX || a.HasY || a.HasZ,
+		TimeMS:   tm,
+	}
+}
+
+func (c *Controller) timeFor(a Action, dx, dy, dz float64) int {
 	var tm int
 	switch {
-	case rapid:
-		tm = p.minTime
-	case haveT:
-		tm = t
-	case p.feed > 0:
-		dist := math.Abs(tx - p.curX)
-		if d := math.Abs(ty - p.curY); d > dist {
+	case a.Rapid:
+		tm = c.minTime
+	case a.HaveTime:
+		tm = a.TimeMS
+	case c.feed > 0:
+		dist := math.Abs(dx)
+		if d := math.Abs(dy); d > dist {
 			dist = d
 		}
-		if d := math.Abs(tz - p.curZ); d > dist {
+		if d := math.Abs(dz); d > dist {
 			dist = d
 		}
 		if dist < 0.001 {
-			tm = p.minTime
+			tm = c.minTime
 		} else {
-			tm = int(60000.0 * dist / p.feed)
+			tm = int(60000.0 * dist / c.feed)
 		}
 	default:
-		tm = p.defTime
+		tm = c.defTime
 	}
-	if tm < p.minTime {
-		tm = p.minTime
+	if tm < c.minTime {
+		tm = c.minTime
 	}
-	if tm > p.maxTime {
-		tm = p.maxTime
+	if tm > c.maxTime {
+		tm = c.maxTime
 	}
-
-	// Commit datum.
-	if hx {
-		p.curX = tx
-	}
-	if hy {
-		p.curY = ty
-	}
-	if hz {
-		p.curZ = tz
-	}
-	return Command{
-		Kind: KindMove,
-		X:    p.curX, Y: p.curY, Z: p.curZ,
-		HasX: hx, HasY: hy, HasZ: hz,
-		Rapid:    rapid,
-		TimeMS:   tm,
-		MovedAny: hx || hy || hz,
-	}
+	return tm
 }
 
 // sanitize strips ';' line comments and '(...)' block comments.

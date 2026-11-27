@@ -130,6 +130,18 @@ func (d *Device) ReadInfo() (Info, []string, error) {
 	return info, warns, nil
 }
 
+// Home issues the gimbal's own recenter (FUNCTION_EVENT BACK_CENTER), which
+// drives the motors to the gimbal's stored neutral — the same physical
+// position as a trigger double-click. Note this is NOT the firmware readback
+// datum (0,0): on pan it typically lands ≈ -18°. Use Angles() to read where it
+// actually settled.
+func (d *Device) Home() error {
+	if err := d.conn.Write(protocol.OpcodeFunctionEvent, protocol.FunctionBackCenter, d.timeout); err != nil {
+		return fmt.Errorf("back-center: %w", err)
+	}
+	return nil
+}
+
 // Move executes a single point-to-position transition. The full sequence
 // mirrors com/zhiyun/device/a.java:93 → d(a, q1):
 //

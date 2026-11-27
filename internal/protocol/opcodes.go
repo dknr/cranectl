@@ -51,4 +51,11 @@ var (
 	OpcodeMotionTimeLow              = Opcode(192, 1, 54) // 0xC136
 	OpcodeMotionTimeHigh             = Opcode(192, 1, 55) // 0xC137
 	OpcodeSetButtonEvent             = Opcode(192, 1, 32) // 0xC120
+	OpcodeFunctionEvent              = Opcode(192, 1, 33) // 0xC121
+)
+
+// FunctionEvent params (com/zhiyun/protocol/constants/FunctionEvent.java).
+const (
+	FunctionBackCenter uint16 = 0 // gimbal home (matches trigger double-click)
+	FunctionBackHead   uint16 = 1 // turn to face user
 )
