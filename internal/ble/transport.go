@@ -257,35 +257,25 @@ func (c *Conn) SendFrame(f protocol.Frame, timeout time.Duration) (protocol.Fram
 		c.mu.Unlock()
 	}()
 
-	// Fire-and-forget writes occasionally lose their ack over BLE, so resend
-	// once on timeout. These protocol commands are idempotent set-ops (and the
-	// Zhiyun app itself does not wait on them), so resending the same frame is
-	// safe.
-	const attempts = 2
-	for i := 0; i < attempts; i++ {
-		if c.debug {
-			if i == 0 {
-				fmt.Printf("TX % x\n", b)
-			} else {
-				fmt.Printf("TX(retry) % x\n", b)
-			}
-		}
-		if _, err := c.wch.WriteWithoutResponse(b); err != nil {
-			return protocol.Frame{}, fmt.Errorf("write: %w", err)
-		}
-		t := time.NewTimer(timeout)
-		select {
-		case reply := <-ch:
-			t.Stop()
-			return reply, nil
-		case <-t.C:
-			t.Stop() // timed out; retry
-		case <-c.done:
-			t.Stop()
-			return protocol.Frame{}, io.ErrClosedPipe
-		}
+	// No retry: this drives a physical machine. A frame that fails to get its
+	// ack (dropped packet, stalled peripheral) must surface as an error so the
+	// caller faults and halts — never silently re-issue a movement command.
+	if c.debug {
+		fmt.Printf("TX % x\n", b)
 	}
-	return protocol.Frame{}, fmt.Errorf("timeout waiting for reply to seq=%d opcode=0x%04X (after %d attempts)", f.Seq, f.Opcode, attempts)
+	if _, err := c.wch.WriteWithoutResponse(b); err != nil {
+		return protocol.Frame{}, fmt.Errorf("write: %w", err)
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case reply := <-ch:
+		return reply, nil
+	case <-t.C:
+		return protocol.Frame{}, fmt.Errorf("timeout waiting for reply to seq=%d opcode=0x%04X", f.Seq, f.Opcode)
+	case <-c.done:
+		return protocol.Frame{}, io.ErrClosedPipe
+	}
 }
 
 // NextSeq returns a fresh sequence byte (1..127 wrapping), matching the
