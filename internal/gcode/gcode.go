@@ -34,6 +34,17 @@ const (
 	KindSetPos      // G92
 	KindAbs         // G90/G91 (modal)
 	KindEnd         // M2/M30
+	KindRecord      // M3/M5 (record on/off) or M240 (photo); see RecOp
+)
+
+// RecOp selects the camera action for a KindRecord plan.
+type RecOp int
+
+const (
+	RecNone  RecOp = iota
+	RecOn          // M3  — start recording
+	RecOff         // M5  — stop recording
+	RecPhoto       // M240 — take a still photo
 )
 
 // Action is one lexed line, before coordinate resolution.
@@ -49,6 +60,7 @@ type Action struct {
 	TimeMS           int
 	HaveTime         bool
 	DwellMS          int
+	RecOp            RecOp
 }
 
 // Plan is a resolved action ready to execute.
@@ -60,6 +72,7 @@ type Plan struct {
 	MovedAny         bool
 	TimeMS           int
 	DwellMS          int
+	RecOp            RecOp
 }
 
 // Limits are per-axis ±degrees (firmware frame). Moves beyond these are
@@ -129,6 +142,15 @@ func (Lexer) Parse(line string) Action {
 		case 2, 30:
 			a.Kind = KindEnd
 			return a
+		case 3:
+			a.Kind, a.RecOp = KindRecord, RecOn
+			return a
+		case 5:
+			a.Kind, a.RecOp = KindRecord, RecOff
+			return a
+		case 240:
+			a.Kind, a.RecOp = KindRecord, RecPhoto
+			return a
 		default:
 			return Action{Err: fmt.Errorf("unsupported M%d", m)}
 		}
@@ -180,6 +202,7 @@ type Controller struct {
 	defTime, minTime, maxTime int
 	abs                       bool
 	feed                      float64
+	recording                 bool    // desired record state (M3/M5), see CameraRecord toggle caveat
 	ox, oy, oz                float64 // origin in firmware coords
 	px, py, pz                float64 // current position in user coords
 }
@@ -206,6 +229,13 @@ func (c *Controller) Origin() (x, y, z float64) { return c.ox, c.oy, c.oz }
 // SetFeed seeds the modal feedrate (deg/min).
 func (c *Controller) SetFeed(f float64) { c.feed = f }
 
+// Recording reports the tracked desired record state.
+func (c *Controller) Recording() bool { return c.recording }
+
+// SetRecording overrides the tracked record state (e.g. to reconcile with a
+// status flag once the definitive "recording?" signal is known).
+func (c *Controller) SetRecording(v bool) { c.recording = v }
+
 // Plan resolves an action, updating modal state (abs/feed) as it goes.
 func (c *Controller) Plan(a Action) Plan {
 	switch a.Kind {
@@ -220,6 +250,8 @@ func (c *Controller) Plan(a Action) Plan {
 		return Plan{Kind: KindIgnore}
 	case KindHome:
 		return Plan{Kind: KindHome}
+	case KindRecord:
+		return c.planRecord(a)
 	case KindSetPos:
 		return c.planSetPos(a)
 	case KindMotion:
@@ -229,6 +261,28 @@ func (c *Controller) Plan(a Action) Plan {
 		return Plan{Kind: KindIgnore, Err: a.Err}
 	}
 	return Plan{Kind: KindIgnore}
+}
+
+func (c *Controller) planRecord(a Action) Plan {
+	// M3/M5 are set-semantics over a hardware toggle: only emit the key on a
+	// transition, so they are idempotent. M240 (photo) always fires.
+	switch a.RecOp {
+	case RecOn:
+		if c.recording {
+			return Plan{Kind: KindIgnore}
+		}
+		c.recording = true
+		return Plan{Kind: KindRecord, RecOp: RecOn}
+	case RecOff:
+		if !c.recording {
+			return Plan{Kind: KindIgnore}
+		}
+		c.recording = false
+		return Plan{Kind: KindRecord, RecOp: RecOff}
+	case RecPhoto:
+		return Plan{Kind: KindRecord, RecOp: RecPhoto}
+	}
+	return Plan{Kind: KindIgnore, Err: errors.New("record: no op")}
 }
 
 func (c *Controller) planSetPos(a Action) Plan {

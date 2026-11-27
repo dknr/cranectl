@@ -149,3 +149,45 @@ func TestUnknownWordError(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
+
+func TestRecordSetSemantics(t *testing.T) {
+	lx, c := newCtl()
+	if p := plan(t, lx, c, "M3"); p.Kind != KindRecord || p.RecOp != RecOn {
+		t.Fatalf("first M3: %+v", p)
+	}
+	if !c.Recording() {
+		t.Fatal("expected recording=true after M3")
+	}
+	// Idempotent: M3 while already recording must not fire.
+	if p := plan(t, lx, c, "M3"); p.Kind != KindIgnore {
+		t.Fatalf("second M3 should be no-op, got %+v", p)
+	}
+	// M5 stops.
+	if p := plan(t, lx, c, "M5"); p.Kind != KindRecord || p.RecOp != RecOff {
+		t.Fatalf("M5: %+v", p)
+	}
+	if c.Recording() {
+		t.Fatal("expected recording=false after M5")
+	}
+	if p := plan(t, lx, c, "M5"); p.Kind != KindIgnore {
+		t.Fatalf("second M5 should be no-op, got %+v", p)
+	}
+	// M240 (photo) always fires.
+	for i := 0; i < 2; i++ {
+		if p := plan(t, lx, c, "M240"); p.Kind != KindRecord || p.RecOp != RecPhoto {
+			t.Fatalf("M240 #%d: %+v", i, p)
+		}
+	}
+}
+
+func TestRecordLexerAcceptsCameraCodes(t *testing.T) {
+	lx, _ := newCtl()
+	for _, m := range []string{"M3", "M5", "M240"} {
+		if a := lx.Parse(m); a.Kind != KindRecord {
+			t.Fatalf("%s lexed to kind %d, want KindRecord", m, a.Kind)
+		}
+	}
+	if a := lx.Parse("M7"); a.Err == nil {
+		t.Fatal("M7 should be rejected")
+	}
+}

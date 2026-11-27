@@ -85,6 +85,8 @@ and makes that pose the origin — so right after `G28`, `G1 X0 Y0` *is* home.
 | `G90` / `G91` | absolute (default) / relative (user frame) |
 | `G92 X_ Y_ Z_` | redefine the current position (shifts the origin) |
 | `G20` / `G21` | accepted, ignored (units are always degrees) |
+| `M3` / `M5` | start / stop video recording (tracked; idempotent set-semantics) |
+| `M240` | take a still photo (momentary) |
 | `M2` / `M30` | program end |
 | `;` … / `(...)` | comments |
 | `N<line>` | line number (ignored) |
@@ -92,6 +94,12 @@ and makes that pose the origin — so right after `G28`, `G1 X0 Y0` *is* home.
 Anything else — unknown words, unsupported codes, or out-of-range axes — is
 **rejected** with an `error:` and puts the daemon into an `Alarm` state until a
 soft reset. Axes are never silently wrapped.
+
+**Camera.** `M3`/`M5` drive the gimbal's record key and `M240` its shutter. The
+record key is a hardware *toggle*; the daemon keeps a `recording` bool so `M3`
+while already recording (or `M5` while stopped) is a no-op. `?` reports it as
+`Rec:0/1`. This tracked bool is authoritative until a definitive
+"currently recording?" status flag is wired in.
 
 ### Two "centers"
 

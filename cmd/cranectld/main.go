@@ -209,6 +209,30 @@ func run(dev *gimbal.Device, st *state, mu *sync.Mutex, ctl *gcode.Controller, p
 		logf("ok")
 	case gcode.KindEnd:
 		logf("ok (program end)")
+	case gcode.KindRecord:
+		var (
+			err   error
+			label string
+		)
+		switch p.RecOp {
+		case gcode.RecOn, gcode.RecOff:
+			err = dev.CameraRecord() // same hardware toggle for both
+			if p.RecOp == gcode.RecOn {
+				label = "record on"
+			} else {
+				label = "record off"
+			}
+		case gcode.RecPhoto:
+			err = dev.CameraPhoto()
+			label = "photo"
+		}
+		if err != nil {
+			logf("error: %v", err)
+			atomic.StoreInt32(&st.fault, 1)
+			atomic.StoreInt32(&st.hold, 1)
+			return
+		}
+		logf("ok (%s)", label)
 	case gcode.KindIgnore:
 		// modal / no-op
 	}
@@ -253,14 +277,19 @@ func reader(f *os.File, dev *gimbal.Device, mu *sync.Mutex, ctl *gcode.Controlle
 func realtime(t string, dev *gimbal.Device, mu *sync.Mutex, ctl *gcode.Controller, st *state) bool {
 	switch {
 	case t == "?" || strings.EqualFold(t, "STATUS"):
-		ux, uy, uz := func() (float64, float64, float64) {
+		ux, uy, uz, rec := func() (float64, float64, float64, bool) {
 			mu.Lock()
 			defer mu.Unlock()
-			return ctl.Position()
+			x, y, z := ctl.Position()
+			return x, y, z, ctl.Recording()
 		}()
 		mx, my, mz, _ := dev.Angles()
-		logf("<%s,MPos:%.2f,%.2f,%.2f|Pos:%.2f,%.2f,%.2f>",
-			stateName(st), ux, uy, uz, mx, my, mz)
+		r := 0
+		if rec {
+			r = 1
+		}
+		logf("<%s,MPos:%.2f,%.2f,%.2f|Pos:%.2f,%.2f,%.2f|Rec:%d>",
+			stateName(st), ux, uy, uz, mx, my, mz, r)
 		return true
 	case t == "!":
 		atomic.StoreInt32(&st.hold, 1)

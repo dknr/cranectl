@@ -130,6 +130,36 @@ func (d *Device) ReadInfo() (Info, []string, error) {
 	return info, warns, nil
 }
 
+// Camera virtual-key codes are SET_BUTTON_EVENT params encoded as
+// ih.g.b(group,bank,idx) = ((group<<8)&0xF00)|(bank<<4)|idx. These are the
+// CRANE-M2S (firmware ≥ 1.7) values from Stabilizer.L0()/a().
+func ihgb(group, bank, idx int) uint16 {
+	return uint16(((group << 8) & 0xF00) | (bank << 4) | idx)
+}
+
+const (
+	cameraKeyRecord uint16 = 0x3D // ihgb(0,3,13) — record toggle
+	cameraKeyPhoto  uint16 = 0x3C // ihgb(0,3,12) — take photo
+)
+
+// CameraRecord toggles video recording — the gimbal's record key (start if
+// stopped, stop if recording). The G-code layer tracks desired state so this
+// fires only on transitions; it is NOT self-consistent on its own.
+func (d *Device) CameraRecord() error {
+	if err := d.conn.Write(protocol.OpcodeSetButtonEvent, cameraKeyRecord, d.timeout); err != nil {
+		return fmt.Errorf("camera-record: %w", err)
+	}
+	return nil
+}
+
+// CameraPhoto takes a single still photo (momentary key press).
+func (d *Device) CameraPhoto() error {
+	if err := d.conn.Write(protocol.OpcodeSetButtonEvent, cameraKeyPhoto, d.timeout); err != nil {
+		return fmt.Errorf("camera-photo: %w", err)
+	}
+	return nil
+}
+
 // Home issues the gimbal's own recenter (FUNCTION_EVENT BACK_CENTER), which
 // drives the motors to the gimbal's stored neutral — the same physical
 // position as a trigger double-click. Note this is NOT the firmware readback
